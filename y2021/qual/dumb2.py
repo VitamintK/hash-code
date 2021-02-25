@@ -41,12 +41,12 @@ schedule = []
 for i in range(I):
     items = list(intersections[i].incoming.items())
     items.sort(key=lambda sv: -sv[1])
-    items = items[:15]
+    # items = items[:15]
     denom = sum(v for s,v in items)
     if denom == 0:
         continue
     mini = min(v for s,v in items)
-    g = [(street, min(int(volume/denom * 15), 15)) for street,volume in items]
+    g = [(street, min(int(volume/mini), 10)) for street,volume in items]
     g = [(s,d) for s,d in g if d > 0]
     schedule.append(IS(i, g))
 

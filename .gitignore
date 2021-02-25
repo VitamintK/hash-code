@@ -10,4 +10,7 @@
 **/e_out.txt
 **/f.txt
 **/f_out.txt
+.ipynb_checkpoints
+__pycache__
+*.out
 .DS_Store

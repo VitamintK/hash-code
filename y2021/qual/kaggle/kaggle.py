@@ -101,30 +101,44 @@ class Sim:
         self.iworld = IWorld(streets, cars, intersections)
         self.score_cache = None
     
-    def get_greedy_schedule(self):
+    def get_greedy_schedule(self, fixed_demands):
+        unsatisfied_demands_by_intersection = defaultdict(list)
+        duration_per_street = defaultdict(lambda: 1)
+        # duration_per_street[1719] = 2
         schedule = Schedule(dict(), streets)
         for intersection_id, intersection in enumerate(self.intersections):
+            if len(intersection.incoming) == 0:
+                continue
             schedule[intersection_id] = IntersectionScheduleGreedy(
                 intersection_id,
                 [(None, 1) for i in intersection.incoming],
                 list(intersection.incoming)
             )
+            # to speed this up, this could all be done at build-time in one pass:
+            for street_id in fixed_demands:
+                if street_id in intersection.incoming:
+                    time, duration = fixed_demands[street_id]
+                    if schedule[intersection_id].time_is_unset(time):
+                        schedule[intersection_id].set(street_id, time, duration)
         print('building iworld')
         self.iworld = IWorld(streets, cars, intersections)
         score = 0
         print('beginning sim')
         for d in range(self.D):
+            #### TODO: should try to use the latest time of arrival instead of earliest!
             updates = []
             for icar in self.iworld.icars:
                 if icar.status == CarStatus.WAITING:
                     street_id = icar.car.path[icar.street_of_path]
                     queue = self.iworld.queues[street_id]
                     if icar == queue[0]:
-                        if schedule.intersection_of(street_id).is_green(street_id, d): 
+                        if schedule.intersection_of(street_id).street_is_unset(street_id):
+                            schedule.intersection_of(street_id).set_soonest(street_id, d, duration_per_street[street_id])
+                        if schedule.intersection_of(street_id).is_green(street_id, d):
                             updates.append(Update(icar.car.id))
-                        elif schedule.intersection_of(street_id).time_is_unset(d) and schedule.intersection_of(street_id).street_is_unset(street_id):
-                            schedule.intersection_of(street_id).set(street_id, d)
-                            updates.append(Update(icar.car.id))
+                        else:
+                            street = self.streets[street_id]
+                            unsatisfied_demands_by_intersection[street.end].append((street_id, d))
                 elif icar.status == CarStatus.DRIVING:
                     icar.duration_on_street += 1
                     if icar.duration_on_street == self.streets[icar.car.path[icar.street_of_path]].duration:
@@ -140,12 +154,29 @@ class Sim:
                     score += self.F + self.D - d - 1
         for intersection_id in schedule:
             schedule[intersection_id].fill_in_rest()
+            schedule[intersection_id].apply_manual_hacks()
+        ##### printing metrics ########
+        # timeline = []
+        # c = 0
+        # for sid,d in schedule[5].schedule:
+        #     timeline.append((sid, c))
+        #     c += d
+        # print(*timeline)
+        ###############################
+        self.unsatisfied_demands_by_intersection = unsatisfied_demands_by_intersection
+        print(score)
+        self.score_cache = score
         return schedule
 
     def score(self, schedule, debug=False):
+        ####### traffic debugging ############
         def debugger(*args, **kwargs):
             if debug:
                 print(*args, **kwargs)
+        TRAFFIC_THRESH = 2
+        intersection_traffic = defaultdict(int)
+        street_traffic = defaultdict(int)
+        ######################################
         if self.score_cache is not None:
             return self.score_cache
         self.iworld = IWorld(streets, cars, intersections)
@@ -160,10 +191,12 @@ class Sim:
                     if icar == queue[0]:
                         if schedule.is_green(street_id, d):
                             updates.append(Update(icar.car.id))
-                        if len(queue) > 1:
+                        if len(queue) >= TRAFFIC_THRESH and debug:
                             street = self.streets[street_id]
-                            debugger('intersection {}: street {} ({}). At time {}, backed up w {} cars'.format(
-                                street.end, street_id, street.name, d, len(queue)))
+                            debugger('intersection {}: street {} ({}). At time {}, backed up w {} cars. t={}'.format(
+                                street.end, street_id, street.name, d, len(queue), d%schedule[street.end].period()))
+                            intersection_traffic[street.end] += 1
+                            street_traffic[street_id] += 1
                 elif icar.status == CarStatus.DRIVING:
                     icar.duration_on_street += 1
                     if icar.duration_on_street == self.streets[icar.car.path[icar.street_of_path]].duration:
@@ -179,6 +212,9 @@ class Sim:
                     score += self.F + self.D - d - 1
                     n += 1
         print(n, 'cars,', score, 'score')
+        debugger('total seconds lost: {} ({})'.format(sum(intersection_traffic.values()), sum(street_traffic.values())))
+        debugger('traffic by intersection:', sorted(intersection_traffic.items(),key=lambda x:x[1]))
+        debugger('traffic by street:', sorted(street_traffic.items(),key=lambda x:x[1]))
         self.score_cache = score
         return score
 
@@ -188,6 +224,19 @@ class IntersectionSchedule:
         self.schedule = schedule
     def period(self):
         return sum(duration for street_id, duration in self.schedule)
+    def index_at_time(self, time):
+        time = time%self.period()
+        t = 0
+        for index, (s_id, duration) in enumerate(self.schedule):
+            t += duration
+            if t > time:
+                return index
+    def get_street(self, street_id):
+        t = 0
+        for s_id, duration in self.schedule:
+            if s_id == street_id:
+                return t,duration
+            t += duration
     def street_id_at_time(self, time):
         time = time%self.period()
         t = 0
@@ -213,15 +262,25 @@ class IntersectionScheduleGreedy(IntersectionSchedule):
         return self.street_id_at_time(time) is None
     def street_is_unset(self, street_id):
         return street_id in self.unused_streets
-    def set(self, street_id, time):
+    def set(self, street_id, time, duration=1):
         assert self.street_id_at_time(time) is None
-        self.schedule[time%self.period()] = (street_id, 1)
+        self.schedule[self.index_at_time(time)] = (street_id, duration)
         self.unused_streets.remove(street_id)
+    def set_soonest(self, street_id, time, duration=1):
+        start = self.index_at_time(time)
+        for i in range(len(self.schedule)):
+            index = (start+i)%len(self.schedule)
+            if self.schedule[index][0] is None:
+                self.schedule[index] = (street_id, duration)
+                self.unused_streets.remove(street_id)
+                break
     def fill_in_rest(self):
         iterator = iter(self.unused_streets)
         for i in range(len(self.schedule)):
             if self.schedule[i][0] is None:
                 self.schedule[i] = (next(iterator), 1)
+    def apply_manual_hacks(self):
+        pass
 
 class Schedule(dict):
     def __init__(self, schedule, streets):
@@ -242,6 +301,7 @@ class Schedule(dict):
         for inter_id, inter in schedule.items():
             add_line(inter.id)
             add_line(len(inter.schedule))
+            assert len(inter.schedule) > 0
             for street_id, duration in inter.schedule:
                 add_line(streets[street_id].name + ' ' + str(duration))
         return '\n'.join(str(line) for line in lines)
@@ -282,9 +342,10 @@ class MonteCarloBeamSearcher:
         candidates = [self.solution]
         ans = self.solution
         for it in tqdm(range(iterations)):
-            if it%1000 == 0:
+            if it%3 == 0:
                 for cand in candidates:
                     print(cand.score())
+                    print(cand.pretty())
             next_candidates = [candidates[0]]
             for cand in candidates:
                 next_candidates.extend(cand.sample_neighbors(samples, temperature=temperature_function(it)))
@@ -306,17 +367,44 @@ class MonteCarloBeamSearcher:
 ###################################################################################
 
 class TrafficSignalingSolution(Solution):
-    def __init__(self, schedule):
-        self.schedule = schedule
+    def __init__(self, fixed_demands):
         self.sim = Sim([D,I,S,V,F], streets, cars, intersections)
+        self.fixed_demands = fixed_demands
+        self.schedule = self.sim.get_greedy_schedule(fixed_demands)
+    def pretty(self):
+        return str(self.fixed_demands)
     def serialize(self):
         return self.schedule.serialize()
     def sample_neighbor(self, temperature):
-        new_schedule = self.schedule.clone()
-        k = int(4 * temperature)
-        for intersection_id in random.sample(list(new_schedule), k):
-            new_schedule[intersection_id].mutate()
-        return TrafficSignalingSolution(new_schedule)
+        assert 0<=temperature<=1
+        def get_value(lower_bound, upper_bound):
+            # inclusive, both ends
+            return lower_bound+(upper_bound-lower_bound)*temperature
+        new_fixed_demands = {k:v for k,v in self.fixed_demands.items()}
+        # delete some existing demands
+        lb, ub = 0, 2
+        k = min(int(get_value(lb,ub)), len(new_fixed_demands))
+        for i in random.sample(list(new_fixed_demands),k):
+            new_fixed_demands.pop(i)
+        # maybe move around some existing demands
+        if random.random() < 0.5:
+            lb, ub = 1, 3
+            k = min(int(get_value(lb,ub)), len(new_fixed_demands))
+            delta = int(30*temperature)
+            for i in random.sample(list(new_fixed_demands), k):
+                time, duration = new_fixed_demands[i]
+                new_fixed_demands[i] = (time+random.randint(-10,delta), duration)
+        # satisfy some unsatisfied demands
+        # (23, 100), (63, 100), (83, 103), (0, 103), (3, 106), (24, 109), (82, 114), (53, 145), (11, 170),
+        # (16, 194), (45, 217), (28, 227), (12, 251), (4, 472), (10, 553), (8, 605), (5, 876)
+        intersection_id = random.choices([5,8,10,4],weights=[3,2,1,1],k=1)[0]
+        k = max(1, int(temperature*3))
+        demands_to_satisfy = random.sample(self.sim.unsatisfied_demands_by_intersection[intersection_id], k)
+        intersection = self.schedule[intersection_id]
+        for street_id, time in demands_to_satisfy:
+            new_fixed_demands[street_id] = (time%intersection.period(), intersection.get_street(street_id)[1])
+        print(new_fixed_demands)
+        return TrafficSignalingSolution(new_fixed_demands)
     def score(self):
         return self.sim.score(self.schedule)
     def heuristic(self):
@@ -348,10 +436,14 @@ def main():
     #     # g = [(s,d) for s,d in g if d > 0]
     #     schedule[i] = IntersectionSchedule(i, g)
     sim = Sim([D,I,S,V,F], streets, cars, intersections)
-    schedule = sim.get_greedy_schedule()
+    schedule = sim.get_greedy_schedule(dict())
     sim.score(schedule, debug=True)
-    initial_solution = TrafficSignalingSolution(schedule)
+
+    starting_demands = {
+        # 1719: (100,2)
+    }
+    initial_solution = TrafficSignalingSolution(starting_demands)
     s = MonteCarloBeamSearcher(initial_solution, best)
-    s.go(100, 2, 5)
+    s.go(100, 3, 5)
 
 main()

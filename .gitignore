@@ -14,3 +14,5 @@
 __pycache__
 *.out
 .DS_Store
+*.zip
+*.in

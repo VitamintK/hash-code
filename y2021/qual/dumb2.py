@@ -46,8 +46,8 @@ for i in range(I):
     if denom == 0:
         continue
     mini = min(v for s,v in items)
-    g = [(street, min(int(volume/mini), 10)) for street,volume in items]
-    g = [(s,d) for s,d in g if d > 0]
+    g = [(street, 1) for street,volume in items if volume>0]
+    # g = [(s,d) for s,d in g if d > 0]
     schedule.append(IS(i, g))
 
 print_schedule(schedule)

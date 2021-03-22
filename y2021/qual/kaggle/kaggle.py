@@ -1,3 +1,4 @@
+from multiprocessing import Pool
 from collections import namedtuple, defaultdict, deque
 from enum import Enum
 import math
@@ -8,36 +9,16 @@ try:
 except ImportError:
     tqdm = lambda x: x
 
-from scipy.optimize import linear_sum_assignment
-import numpy as np
+# from scipy.optimize import linear_sum_assignment
+# import numpy as np
 
-#### read in input ###########
+directory = 'data'
+PARALLELIZATION = 3
+
+InputData = namedtuple("InputData", ['D', 'I', 'S', 'V', 'F', 'streets', 'cars', 'intersections'])
 Street = namedtuple("Street", ['start', 'end', 'name', 'duration', 'id'])
 Car = namedtuple("Car", ["id", "path"])
 Intersection = namedtuple("Intersection", "incoming")
-D, I, S, V, F = map(int, input().split())
-streets = []
-street_name_to_street_id = dict()
-intersections = [Intersection(incoming=defaultdict(int)) for i in range(I)]
-for i in range(S):
-    s, e, n, d = input().split()
-    streets.append(Street(int(s), int(e), n, int(d), i))
-    # intersections[int(e)].incoming[i] += 1
-    street_name_to_street_id[n] = i
-cars = []
-for i in range(V):
-    inp = input().split()
-    path = inp[1:]
-    nice_path = [street_name_to_street_id[x] for x in path]
-    cars.append(Car(i,nice_path))
-################################
-
-for car in cars:
-    for street_id in car.path[:-1]:
-        intersections[streets[street_id].end].incoming[street_id] += 1
-
-def intersections_of_path(street_ids):
-    return [street_ids[0].start] + [streets[sid].end for sid in street_ids]
 
 """ ICar: instantaneous car.
 street_of_path = 2 means that the car is on the 2th street in its path.
@@ -109,7 +90,10 @@ class Sim:
         all_demands_by_intersection = defaultdict(list)
         duration_per_street = defaultdict(lambda: 1)
         print('making schedule')
-        schedule = Schedule(dict(), streets)
+        schedule = Schedule(dict(), self.streets)
+        fixed_demands_by_intersection = defaultdict(dict)
+        for street_id, (time, duration) in fixed_demands.items():
+            fixed_demands_by_intersection[self.streets[street_id].end][street_id] = (time,duration)
         for intersection_id, intersection in enumerate(self.intersections):
             if len(intersection.incoming) == 0:
                 continue
@@ -119,17 +103,21 @@ class Sim:
                 list(intersection.incoming)
             )
             # to speed this up, this could all be done at build-time in one pass:
-            for street_id in fixed_demands:
+            # TODO: NEEDS TO BE SORTED BY PERIODIC TIME, NOT ABSOLUTE TIME
+            intersection_fixed_demands = fixed_demands_by_intersection[intersection_id]
+            intersection_period = len(intersection.incoming) - len(fixed_demands_by_intersection[intersection_id]) + sum(d for t,d in intersection_fixed_demands.values())
+            for street_id, (time, duration) in sorted(intersection_fixed_demands.items(), key=lambda x: x[1][0]%intersection_period):
                 if street_id in intersection.incoming:
-                    time, duration = fixed_demands[street_id]
                     if schedule[intersection_id].time_is_unset(time):
                         schedule[intersection_id].set(street_id, time, duration)
+                    # else:
+                    #     print(street_id, time, duration, ':', schedule[intersection_id].street_id_at_time(time))
             schedule[intersection_id].make_cache()
         print('building iworld')
-        self.iworld = IWorld(streets, cars, intersections)
+        self.iworld = IWorld(self.streets, self.cars, self.intersections)
         score = 0
         print('beginning sim')
-        for d in tqdm(range(self.D)):
+        for d in range(self.D):
             #### TODO: should try to use the latest time of arrival instead of earliest!
             updates = []
             for icar in self.iworld.icars:
@@ -281,14 +269,7 @@ class IntersectionSchedule:
     #         t += duration
     def street_id_at_time(self, time):
         return self.schedule[self.index_at_time(time)][0]
-        # t = 0
-        # for s_id, duration in self.schedule:
-        #     t += duration
-        #     if t > time:
-        #         return s_id
     def is_green(self, street_id, time):
-        # THIS IS REALLY SLOW.  CAN BE AMORTIZED O(1)-ish (persisting a pointer), OR O(LOGN) (binary search each time) INSTEAD OF O(N) where N is number of streets on this intersection
-        # or amortized O(1) with O(period) space
         return self.street_id_at_time(time) == street_id
     def mutate(self):
         random.shuffle(self.schedule)
@@ -355,9 +336,15 @@ class Schedule(dict):
 ##################################################################################
 ### Copied from my AZsPCs template
 ###
+def f(args):
+    obj, temperature = args
+    return obj.sample_neighbor(temperature)
+
 class Solution:
     def sample_neighbors(self, n: int, temperature):
-        return (self.sample_neighbor(temperature) for i in range(n)) 
+        with Pool(PARALLELIZATION) as p:
+            return p.map(f, [(self, temperature) for i in range(n)])
+        # return (self.sample_neighbor(temperature) for i in range(n)) 
     def sample_neighbor(self, temperature):
         """temperature is a float from 0 to 1.  1 meaning lots of change, 0 being no change."""
         raise NotImplementedError 
@@ -380,7 +367,7 @@ class MonteCarloBeamSearcher:
         self.best_of_all_time = best_of_all_time
     def go(self, iterations = 1000, population = 10, samples = 20):
         # linear temperature function:
-        temperature_function = lambda x: 1 - x/iterations 
+        temperature_function = lambda x: (1 - x/iterations ) * 0.3
         if self.solution is None:
             raise ValueError
         candidates = [self.solution]
@@ -411,11 +398,15 @@ class MonteCarloBeamSearcher:
 ###################################################################################
 
 class DemandBasedTrafficSignalingSolution(Solution):
-    def __init__(self, fixed_demands):
+    def __init__(self, inputs, fixed_demands):
+        self.inputs = inputs
+        D,I,S,V,F,streets,cars,intersections = self.inputs
         self.sim = Sim([D,I,S,V,F], streets, cars, intersections)
         self.fixed_demands = fixed_demands
         self.schedule = self.sim.get_greedy_schedule(fixed_demands)
     def pretty(self):
+        return str(self.fixed_demands)
+    def repr(self):
         return str(self.fixed_demands)
     def serialize(self):
         return self.schedule.serialize()
@@ -430,13 +421,13 @@ class DemandBasedTrafficSignalingSolution(Solution):
             return lower_bound+(upper_bound-lower_bound)*temperature
         new_fixed_demands = {k:v for k,v in self.fixed_demands.items()}
         # maybe delete some existing demands
-        if random.random() < 0.5:
+        if random.random() < 0.35:
             lb, ub = 0, 2
             k = min(int(get_value(lb,ub)), len(new_fixed_demands))
             for i in random.sample(list(new_fixed_demands),k):
                 new_fixed_demands.pop(i)
         # maybe move around some existing demands
-        if random.random() < 0.5:
+        if random.random() < get_value(0.15,0.35):
             lb, ub = 1, 3
             k = min(int(get_value(lb,ub)), len(new_fixed_demands))
             earlier_delta = int(-10 * temperature)
@@ -445,7 +436,7 @@ class DemandBasedTrafficSignalingSolution(Solution):
                 time, duration = new_fixed_demands[i]
                 new_fixed_demands[i] = (time+random.randint(earlier_delta,later_delta), duration)
         # maybe change the durations of some existing demands
-        if random.random() < 0.35:
+        if random.random() < get_value(0.15,0.35):
             lb, ub = 1,3
             k = min(int(get_value(lb,ub)), len(new_fixed_demands))
             for i in random.sample(list(new_fixed_demands), k):
@@ -459,10 +450,12 @@ class DemandBasedTrafficSignalingSolution(Solution):
         demands_to_satisfy = random.sample(self.sim.unsatisfied_demands_by_intersection[intersection_id], k)
         intersection = self.schedule[intersection_id]
         for street_id, time in demands_to_satisfy:
-            new_fixed_demands[street_id] = (time%intersection.period(), get_random_duration())
+            # TODO: DON'T USE TIME%PERIOD HERE -- JUST USE THE RAW TIME
+            # %intersection.period
+            new_fixed_demands[street_id] = (time, get_random_duration())
         # done
         print(new_fixed_demands)
-        return DemandBasedTrafficSignalingSolution(new_fixed_demands)
+        return DemandBasedTrafficSignalingSolution(self.inputs, new_fixed_demands)
     def sample_neighbor_perfect_matching(self, temperature):
         intersections_to_choose = [(23, 100), (63, 100), (83, 103), (0, 103), (3, 106), (24, 109), (82, 114), (53, 145), (11, 170), (16, 194), (45, 217), (28, 227), (12, 251), (4, 472), (10, 553), (8, 605), (5, 876)]
         pop, weights = zip(*intersections_to_choose)
@@ -501,9 +494,11 @@ class DemandBasedTrafficSignalingSolution(Solution):
     def heuristic(self):
         return self.score()
     def save(self):
-        with open('kaggle.out', 'w') as f:
+        with open(f'{directory}/kaggle.out', 'w') as f:
             f.write(self.serialize())
-        with open('kaggle_score.out', 'w') as f:
+        with open(f'{directory}/kaggle_repr.out', 'w') as f:
+            f.write(self.repr())
+        with open(f'{directory}/kaggle_score.out', 'w') as f:
             f.write(str(self.score()))
 
 class ScheduleBasedTrafficSignalingSolution(Solution):
@@ -554,33 +549,59 @@ class ScheduleBasedTrafficSignalingSolution(Solution):
     def heuristic(self):
         return self.score()
     def save(self):
-        with open('kaggle.out', 'w') as f:
+        with open(f'{directory}/kaggle.out', 'w') as f:
             f.write(self.serialize())
-        with open('kaggle_score.out', 'w') as f:
+        with open(f'{directory}/kaggle_score.out', 'w') as f:
             f.write(str(self.score()))
 
-def main():
+def main(inputs):
     try:
-        with open('kaggle_score.out', 'r') as f:
+        with open(f'{directory}/kaggle_score.out', 'r') as f:
             best = int(f.readline())
     except FileNotFoundError:
-        with open('kaggle_score.out', 'w') as f:
+        with open(f'{directory}/kaggle_score.out', 'w') as f:
             f.write('0')
         best = 0
 
+    try:
+        with open(f'{directory}/kaggle_repr.out', 'r') as f:
+            starting_demands = eval(f.readline())
+    except FileNotFoundError:
+        starting_demands = dict()
+
+    D, I, S, V, F, streets, cars, intersections = inputs
     # sim = Sim([D,I,S,V,F], streets, cars, intersections)
     # schedule = sim.get_greedy_schedule(dict())
     # sim.score(schedule, debug=True)
-
-    starting_demands = {
-        2009: (219, 1), 1679: (73, 1), 1427: (160, 1), 1657: (85, 1), 1989: (218, 1), 2843: (63, 1), 1835: (92, 1),
-        3613: (158, 1), 2811: (100, 1), 2827: (62, 1), 2951: (107, 1), 3469: (23, 1), 3577: (167, 1), 2845: (39, 1),
-        3519: (141, 1), 3545: (38, 1), 1057: (29, 1), 2001: (188, 1), 2979: (148, 1), 2825: (138, 1), 3341: (129, 1),
-        1545: (188, 1), 3065: (138, 1), 3335: (109, 1), 2925: (173, 1), 1787: (212, 1), 1963: (201, 1), 3639: (88, 1),
-        3647: (78, 1), 7097: (71, 1), 7231: (78, 1), 1719: (148, 1), 2023: (68, 1), 1945: (99, 1), 1775: (229, 1)
-    }
-    initial_solution = DemandBasedTrafficSignalingSolution({})
+    # starting = {27390: (8, 2), 34269: (28, 1), 39289: (10, 1), 39297: (9, 1), 15194: (9, 3), 1241: (36, 2), 8373: (29, 3), 8455: (22, 1), 8449: (34, 2), 8962: (3, 2), 28859: (16, 2), 28829: (5, 1), 10014: (29, 1), 29692: (0, 1), 40945: (11, 2), 19001: (17, 1), 18981: (3, 2), 18993: (5, 3), 45864: (11, 2), 50897: (12, 3), 50889: (1, 1), 39884: (7, 1), 46613: (20, 2), 46611: (18, 1), 6367: (70, 1), 6293: (45, 1), 6373: (41, 1), 22069: (0, 1), 22075: (15, 1), 17917: (7, 2), 17931: (13, 1), 17953: (8, 2), 33092: (3, 2), 18490: (1, 2), 58995: (4, 2), 8475: (10, 1), 8471: (19, 1), 49110: (4, 1), 59362: (0, 2), 48807: (3, 1), 48817: (11, 2), 26307: (10, 3), 6756: (2, 2), 10469: (56, 1), 10571: (56, 2), 3999: (81, 1), 4095: (62, 1), 17926: (2, 1), 3722: (0, 1), 16603: (2, 2), 33043: (11, 1), 26449: (20, 1), 6481: (33, 1), 30516: (9, 2), 1835: (230, 1), 29861: (25, 1), 24963: (8, 1), 44336: (6, 2), 23671: (18, 1), 30967: (10, 1), 49742: (4, 1), 48423: (3, 2), 28082: (2, 3), 10205: (6, 1), 9987: (20, 1), 2527: (26, 1), 20812: (0, 1), 15281: (0, 1), 52691: (1, 1), 2991: (139, 1), 7215: (32, 1), 34111: (3, 1), 9251: (13, 1), 4980: (8, 1), 4325: (34, 1), 44329: (3, 1)}
+    # starting_demands = {4779: (5, 1), 4755: (-2, 2), 4767: (38, 2), 2353: (2, 1), 2351: (25, 2), 3063: (113, 1), 13815: (14, 2), 2854: (3, 1), 50121: (14, 2), 15763: (44, 1), 25229: (10, 1), 49537: (2, 1), 2473: (48, 1), 12749: (28, 1), 30817: (13, 1), 30835: (11, 2), 13817: (35, 1), 13831: (19, 1), 29695: (9, 2), 57575: (2, 1), 53656: (-3, 2), 3201: (24, 1), 3217: (51, 2), 60293: (5, 2), 14801: (7, 1), 4620: (6, 1), 39183: (5, 1), 59074: (3, 2), 3282: (12, 1), 22617: (4, 2), 44802: (1, 1), 38374: (3, 1), 21600: (3, 2), 35791: (6, 1), 4882: (2, 1), 30730: (2, 2), 12353: (43, 1), 12858: (2, 1), 5311: (88, 1), 19753: (1, 2), 17451: (6, 1), 11997: (18, 1), 36267: (10, 1), 47731: (6, 1), 4677: (78, 1), 48815: (1, 1), 58624: (3, 2), 38727: (3, 2), 25177: (13, 1), 15619: (48, 1), 55296: (2, 1), 28728: (5, 1), 5804: (0, 1), 18982: (3, 2), 38012: (2, 1), 44861: (1, 2), 20822: (1, 2), 17246: (0, 2), 60363: (12, 2), 48329: (1, 2), 28080: (2, 1), 19986: (5, 1), 5130: (1, 2), 27953: (4, 2), 7827: (27, 1), 24251: (2, 2), 35833: (7, 1), 55741: (0, 2), 3971: (59, 1), 31843: (13, 1), 15907: (13, 1), 45854: (7, 1), 59982: (1, 1), 18760: (2, 2), 9257: (24, 1), 829: (55, 1), 2791: (182, 1), 29423: (0, 1), 1796: (1, 2)}
+    # starting_demands = {4779: (5, 1), 4755: (-2, 2), 4767: (38, 2), 2353: (2, 1), 2351: (25, 2), 3063: (113, 1), 13815: (14, 2), 2854: (3, 1), 50121: (14, 2), 15763: (44, 1), 25229: (10, 1), 49537: (9, 1), 2473: (48, 1), 12749: (28, 1), 30817: (13, 1), 30835: (11, 2), 13817: (35, 1), 13831: (19, 1), 29695: (16, 2), 57575: (9, 1), 53656: (-3, 2), 3201: (24, 1), 3217: (51, 2), 60293: (5, 2), 14801: (7, 1), 4620: (6, 1), 39183: (5, 1), 59074: (3, 2), 3282: (12, 1), 22617: (4, 2), 44802: (1, 1), 38374: (3, 1), 21600: (3, 2), 35791: (6, 1), 4882: (2, 1), 30730: (2, 1), 12353: (43, 1), 12858: (7, 1), 5311: (88, 1), 19753: (1, 2), 17451: (6, 1), 11997: (18, 1), 36267: (10, 1), 47731: (6, 1), 4677: (78, 1), 48815: (1, 1), 58624: (3, 2), 38727: (3, 2), 25177: (13, 1), 15619: (48, 1), 55296: (2, 1), 28728: (5, 1), 5804: (0, 1), 18982: (3, 2), 38012: (2, 1), 44861: (1, 2), 20822: (1, 2), 17246: (0, 2), 60363: (12, 2), 48329: (1, 2), 28080: (9, 1), 19986: (5, 1), 5130: (1, 2), 27953: (4, 2), 7827: (27, 1), 24251: (2, 2), 35833: (7, 1), 55741: (0, 2), 3971: (59, 1), 31843: (13, 1), 15907: (13, 1), 45854: (7, 1), 59982: (1, 1), 18760: (2, 2), 9257: (24, 1), 829: (63, 1), 2791: (182, 1), 29423: (0, 1), 1796: (1, 2), 9026: (2952, 2), 10701: (3411, 1), 25649: (3380, 1), 38744: (3034, 1), 24503: (2943, 1), 157: (3359, 1), 50733: (1702, 1), 5734: (1268, 2), 54145: (670, 1), 15059: (2328, 1), 19207: (2054, 1), 34330: (1456, 2), 21607: (3710, 1), 46415: (3475, 2), 4617: (1461, 3), 17495: (3057, 1), 31746: (1755, 1), 42737: (2733, 1), 45407: (3490, 2), 57946: (2040, 1), 15103: (2488, 1), 5727: (3360, 1), 18750: (1653, 2), 3769: (2808, 1), 51597: (2367, 1), 22245: (3310, 1), 47851: (2914, 1), 24029: (2019, 1), 14144: (2385, 1), 24637: (435, 1), 47682: (1725, 1), 5637: (2430, 1), 23723: (3558, 1)}
+    # starting_demands = {4779: (5, 1), 4755: (-2, 2), 4767: (38, 2), 2353: (2, 1), 2351: (25, 2), 3063: (113, 1), 13815: (14, 2), 2854: (3, 1), 50121: (14, 2), 15763: (44, 1), 25229: (10, 1), 49537: (9, 1), 2473: (48, 1), 12749: (28, 1), 30817: (13, 1), 30835: (11, 2), 13817: (35, 1), 13831: (27, 1), 29695: (16, 2), 57575: (9, 1), 53656: (-3, 2), 3201: (24, 1), 3217: (51, 2), 60293: (5, 2), 14801: (7, 1), 4620: (6, 1), 39183: (6, 1), 59074: (3, 2), 3282: (12, 1), 22617: (3382, 1), 44802: (1, 1), 38374: (3, 1), 21600: (3, 2), 35791: (6, 1), 4882: (2, 1), 30730: (9, 1), 12353: (43, 1), 12858: (7, 1), 5311: (88, 1), 19753: (1, 2), 17451: (11, 1), 11997: (18, 1), 36267: (14, 1), 47731: (6, 1), 4677: (78, 1), 48815: (4, 1), 58624: (3, 2), 38727: (3, 2), 25177: (13, 1), 15619: (49, 1), 55296: (2, 1), 28728: (5, 1), 5804: (0, 1), 18982: (3, 2), 38012: (2, 1), 44861: (1, 2), 20822: (2, 2), 17246: (0, 2), 60363: (12, 2), 48329: (1, 2), 28080: (9, 1), 19986: (5, 1), 5130: (1, 1), 27953: (4, 2), 7827: (27, 1), 24251: (2, 2), 35833: (7, 1), 55741: (0, 2), 3971: (59, 1), 31843: (13, 1), 15907: (12, 1), 45854: (7, 1), 59982: (1, 1), 18760: (2, 2), 9257: (24, 1), 829: (67, 1), 2791: (182, 1), 29423: (0, 1), 1796: (1, 2), 9026: (2956, 2), 10701: (3411, 1), 25649: (3380, 1), 38744: (3035, 1), 24503: (2943, 1), 157: (3359, 1), 50733: (1702, 1), 5734: (1268, 2), 54145: (670, 1), 15059: (2328, 1), 19207: (2063, 1), 34330: (1464, 2), 21607: (3710, 1), 46415: (3475, 2), 4617: (1461, 3), 17495: (3057, 1), 31746: (1755, 1), 42737: (2733, 1), 45407: (3490, 2), 57946: (2039, 1), 15103: (2488, 1), 5727: (3360, 1), 18750: (1653, 1), 3769: (2808, 1), 51597: (2367, 1), 22245: (3310, 1), 47851: (2914, 1), 24029: (2019, 1), 14144: (2385, 1), 24637: (435, 1), 47682: (1732, 1), 5637: (2430, 1), 23723: (3558, 1), 19204: (3313, 1), 20367: (3018, 1), 54299: (2554, 2), 7125: (600, 1), 53783: (3836, 1), 42062: (2916, 1), 19133: (3136, 1), 57764: (2136, 3), 4005: (2934, 1), 59157: (2781, 2), 12789: (3482, 1), 18661: (3214, 1), 7373: (2710, 1), 3627: (1445, 1), 47603: (2857, 1), 20833: (1705, 1), 13440: (3090, 1), 16901: (1738, 1), 25195: (3157, 1), 14771: (3408, 1), 6455: (3399, 1), 24396: (2358, 1), 31759: (3117, 1), 41222: (3083, 1), 62851: (1426, 2), 6533: (3715, 1), 15774: (2247, 1), 1109: (3325, 1), 56470: (2905, 2), 19831: (3655, 1), 24076: (1389, 2), 23464: (3070, 1), 8335: (3627, 1), 33151: (3565, 1), 14531: (3069, 1), 15858: (2263, 1), 41975: (2867, 1), 27918: (2651, 2), 123: (2522, 1), 9471: (3204, 1), 44549: (2094, 1), 35347: (3338, 1), 26309: (3489, 1), 23615: (1518, 2), 57499: (3379, 2), 3839: (1440, 1), 41345: (2900, 1), 30406: (1076, 2), 47823: (3193, 1), 38632: (1795, 2), 34315: (385, 1), 20202: (2258, 1), 32785: (872, 2), 62059: (3320, 2), 20427: (2914, 1), 15191: (3272, 1), 50656: (1323, 1), 10805: (3303, 1), 37020: (2956, 3), 45829: (994, 1), 33789: (2566, 1), 29107: (2951, 1), 18525: (3239, 1), 31795: (1334, 1), 10321: (3518, 1), 473: (1344, 1), 3663: (2713, 1), 3883: (4082, 1), 16717: (3769, 1), 53941: (2907, 1), 33321: (2358, 1), 13427: (3226, 1), 25130: (2419, 2), 49585: (2724, 1), 13099: (2165, 1), 45101: (1730, 1), 1647: (1134, 1), 28417: (1653, 1), 1372: (973, 1), 53596: (3180, 1), 10423: (2995, 1), 10047: (3473, 1), 4435: (3221, 1), 13616: (1251, 1), 48321: (2608, 2), 37458: (3384, 2), 15492: (1432, 1), 24552: (1330, 1), 5377: (2548, 1), 2779: (3485, 1), 27751: (3397, 2), 14667: (2745, 1), 1675: (3315, 1), 27678: (1847, 1), 32395: (3064, 1), 60447: (1722, 1), 8577: (3768, 1), 39880: (1409, 1), 20447: (2704, 1), 19817: (1984, 1), 54445: (2452, 2), 59780: (2222, 1), 29251: (2428, 1), 12496: (2775, 1), 7209: (2069, 1), 10784: (2589, 1), 828: (3053, 1), 18715: (3397, 1), 4135: (3046, 1), 2979: (3762, 1), 30523: (2798, 1), 32329: (2761, 1), 8261: (3513, 1), 20812: (1385, 1), 3043: (2148, 1), 2553: (2788, 1), 34648: (3110, 1), 39942: (994, 2), 18841: (2689, 1), 4643: (2581, 2), 58429: (1528, 1), 44077: (2942, 1), 49013: (3291, 1), 53382: (3404, 1), 55501: (2076, 1), 21524: (2821, 1), 56511: (1570, 2), 10415: (3219, 1), 19776: (1106, 1), 57023: (3821, 1), 5583: (2429, 1), 33046: (2715, 2), 13670: (2380, 1), 62501: (821, 1), 62949: (2595, 2), 57361: (983, 2), 891: (2241, 1), 43925: (3567, 1), 7293: (3288, 1), 18393: (3526, 1), 33005: (3091, 2), 29853: (3041, 1), 33836: (1822, 1), 21459: (3537, 1), 28235: (3207, 1), 21144: (3672, 1), 19205: (2373, 1), 16949: (2757, 1), 8815: (2679, 1), 13555: (2687, 1), 36023: (2628, 1), 2855: (2501, 1), 61428: (821, 1), 8625: (1944, 1), 2951: (2654, 1), 26007: (2972, 1), 14019: (3004, 1), 18637: (3658, 1), 5413: (2643, 1), 6917: (3253, 1), 8202: (2401, 3), 12978: (1924, 1), 31399: (3233, 1), 12712: (2901, 1), 3081: (2697, 1), 8875: (1322, 1), 37101: (2988, 1), 49883: (3237, 3), 61563: (3403, 1), 26100: (753, 1), 61725: (3009, 1), 15144: (2990, 1), 41207: (3747, 1), 5961: (2024, 1), 18127: (2536, 1), 39060: (2794, 2), 32209: (1976, 2), 17109: (3452, 1), 41381: (1562, 1), 38018: (1811, 1), 46968: (956, 1), 17699: (3580, 1), 62569: (1678, 1), 4195: (1947, 1), 48312: (777, 1), 8413: (3480, 1), 49375: (2911, 1), 55105: (1014, 2), 561: (3201, 1), 56837: (700, 2), 11656: (1198, 1), 3129: (2049, 1), 31033: (2361, 2), 34541: (1149, 1), 8467: (2266, 1), 55275: (1440, 1), 51173: (2161, 1), 3751: (3174, 1), 55283: (2954, 3), 62533: (2065, 2), 406: (3139, 2), 534: (3951, 1), 11285: (3634, 1), 3367: (1097, 1), 10491: (1241, 1), 4455: (2903, 1), 13596: (2623, 1)}
+    initial_solution = DemandBasedTrafficSignalingSolution(inputs, starting_demands)
     s = MonteCarloBeamSearcher(initial_solution, best)
-    s.go(100, 2, 6)
+    s.go(900, 2, 6)
 
-main()
+if __name__ == '__main__':
+    #### read in input ###########
+    D, I, S, V, F = map(int, input().split())
+    streets = []
+    street_name_to_street_id = dict()
+    intersections = [Intersection(incoming=defaultdict(int)) for i in range(I)]
+    for i in range(S):
+        s, e, n, d = input().split()
+        streets.append(Street(int(s), int(e), n, int(d), i))
+        # intersections[int(e)].incoming[i] += 1
+        street_name_to_street_id[n] = i
+    cars = []
+    for i in range(V):
+        inp = input().split()
+        path = inp[1:]
+        nice_path = [street_name_to_street_id[x] for x in path]
+        cars.append(Car(i,nice_path))
+    ################################
+
+    for car in cars:
+        for street_id in car.path[:-1]:
+            intersections[streets[street_id].end].incoming[street_id] += 1
+    inputs = InputData(D, I, S, V, F, streets, cars, intersections)
+    main(inputs)

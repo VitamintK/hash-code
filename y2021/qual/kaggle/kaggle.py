@@ -13,7 +13,7 @@ except ImportError:
 # import numpy as np
 
 directory = 'data'
-PARALLELIZATION = 3
+PARALLELIZATION = 4
 
 InputData = namedtuple("InputData", ['D', 'I', 'S', 'V', 'F', 'streets', 'cars', 'intersections'])
 Street = namedtuple("Street", ['start', 'end', 'name', 'duration', 'id'])
@@ -343,7 +343,8 @@ def f(args):
 class Solution:
     def sample_neighbors(self, n: int, temperature):
         with Pool(PARALLELIZATION) as p:
-            return p.map(f, [(self, temperature) for i in range(n)])
+            res = p.map(f, [(self, temperature) for i in range(n)])
+        return res
         # return (self.sample_neighbor(temperature) for i in range(n)) 
     def sample_neighbor(self, temperature):
         """temperature is a float from 0 to 1.  1 meaning lots of change, 0 being no change."""
@@ -367,7 +368,7 @@ class MonteCarloBeamSearcher:
         self.best_of_all_time = best_of_all_time
     def go(self, iterations = 1000, population = 10, samples = 20):
         # linear temperature function:
-        temperature_function = lambda x: (1 - x/iterations ) * 0.3
+        temperature_function = lambda x: (1 - x/iterations ) * 0.5
         if self.solution is None:
             raise ValueError
         candidates = [self.solution]
@@ -450,14 +451,14 @@ class DemandBasedTrafficSignalingSolution(Solution):
         demands_to_satisfy = random.sample(self.sim.unsatisfied_demands_by_intersection[intersection_id], k)
         intersection = self.schedule[intersection_id]
         for street_id, time in demands_to_satisfy:
-            # TODO: DON'T USE TIME%PERIOD HERE -- JUST USE THE RAW TIME
             # %intersection.period
             new_fixed_demands[street_id] = (time, get_random_duration())
         # done
         print(new_fixed_demands)
         return DemandBasedTrafficSignalingSolution(self.inputs, new_fixed_demands)
     def sample_neighbor_perfect_matching(self, temperature):
-        intersections_to_choose = [(23, 100), (63, 100), (83, 103), (0, 103), (3, 106), (24, 109), (82, 114), (53, 145), (11, 170), (16, 194), (45, 217), (28, 227), (12, 251), (4, 472), (10, 553), (8, 605), (5, 876)]
+        # intersections_to_choose = [(23, 100), (63, 100), (83, 103), (0, 103), (3, 106), (24, 109), (82, 114), (53, 145), (11, 170), (16, 194), (45, 217), (28, 227), (12, 251), (4, 472), (10, 553), (8, 605), (5, 876)]
+        intersections_to_choose = [(k, len(v)) for k, v in self.sim.unsatisfied_demands_by_intersection.items()]
         pop, weights = zip(*intersections_to_choose)
         intersection_id = random.choices(pop,weights,k=1)[0]
         demands_to_satisfy = self.sim.all_demands_by_intersection[intersection_id]

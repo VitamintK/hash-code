@@ -422,7 +422,7 @@ class DemandBasedTrafficSignalingSolution(Solution):
             return lower_bound+(upper_bound-lower_bound)*temperature
         new_fixed_demands = {k:v for k,v in self.fixed_demands.items()}
         # maybe delete some existing demands
-        if random.random() < 0.35:
+        if random.random() < get_value(0.15,0.35):
             lb, ub = 0, 2
             k = min(int(get_value(lb,ub)), len(new_fixed_demands))
             for i in random.sample(list(new_fixed_demands),k):

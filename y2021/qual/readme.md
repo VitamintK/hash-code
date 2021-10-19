@@ -25,3 +25,5 @@ F – Forever jammed: 1,068,767 points
 Total score
 9,226,144 points
 ```
+
+I continued in the Kaggle extended round: see my code and results in [./kaggle](kaggle)
